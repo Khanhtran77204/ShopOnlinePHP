@@ -11,7 +11,7 @@ class Database {
             $this->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
             $this->createTables();
         } catch (PDOException $e) {
-            die("Lỗi kết nối database: " . $e->getMessage());
+            die("Không thể kết nối database: " . $e->getMessage());
         }
     }
     
@@ -199,6 +199,12 @@ if (isset($_POST['send_message']) && isset($_SESSION['user_id']) && isset($_POST
     }
 }
 
+// Xử lý tin nhắn từ form khác (sử dụng 'message' thay vì 'chat_message')
+if (isset($_POST['message']) && isset($_SESSION['user_id'])) {
+    $stmt = $pdo->prepare("INSERT INTO messages (user_id, message, sender) VALUES (?, ?, 'user')");
+    $stmt->execute([$_SESSION['user_id'], trim($_POST['message'])]);
+}
+
 // Xử lý yêu cầu dịch vụ trả hàng
 if (isset($_POST['request_return']) && isset($_SESSION['user_id'])) {
     $stmt = $pdo->prepare("INSERT INTO returns (order_id, reason) VALUES (?, ?)");
@@ -236,6 +242,10 @@ if (isset($_POST['add_product']) && isset($_SESSION['role']) && $_SESSION['role'
         } else {
             $error = "File không hợp lệ! Chỉ chấp nhận file ảnh (JPG, PNG, GIF, WEBP) và kích thước tối đa 5MB.";
         }
+    }
+    
+    if (empty($image)) {
+        $error = "Vui lòng nhập URL hình ảnh hoặc tải lên hình ảnh hợp lệ!";
     }
     
     $stmt = $pdo->prepare("INSERT INTO products (name, description, price, image, stock) VALUES (?, ?, ?, ?, ?)");
@@ -303,6 +313,10 @@ if (isset($_POST['add_to_cart'])) {
         } else {
             $_SESSION['cart'][$product_id] = $quantity;
         }
+
+         // ✅ Trừ tồn kho ngay sau khi thêm vào giỏ
+         $stmt = $pdo->prepare("UPDATE products SET stock = stock - ? WHERE id = ?");
+         $stmt->execute([$quantity, $product_id]);
         $message = "Đã thêm sản phẩm vào giỏ hàng!";
     } else {
         $error = "Sản phẩm không đủ số lượng trong kho!";
@@ -312,21 +326,57 @@ if (isset($_POST['add_to_cart'])) {
 // Xử lý xóa khỏi giỏ hàng
 if (isset($_POST['remove_from_cart'])) {
     $product_id = (int)$_POST['product_id'];
+    $removed_quantity = $_SESSION['cart'][$product_id] ?? 0;
     unset($_SESSION['cart'][$product_id]);
+    // Khôi phục tồn kho khi xóa sản phẩm khỏi giỏ
+    if ($removed_quantity > 0) {
+        $stmt = $pdo->prepare("UPDATE products SET stock = stock + ? WHERE id = ?");
+        $stmt->execute([$removed_quantity, $product_id]);
+    }
     $message = "Đã xóa sản phẩm khỏi giỏ hàng!";
 }
 
 // Xử lý cập nhật số lượng giỏ hàng
 if (isset($_POST['update_cart'])) {
-    foreach ($_POST['quantities'] as $product_id => $quantity) {
-        if ($quantity > 0) {
-            $_SESSION['cart'][$product_id] = (int)$quantity;
+    foreach ($_POST['quantities'] as $product_id => $new_quantity) {
+        $product_id = (int)$product_id;
+        $new_quantity = (int)$new_quantity;
+
+        $old_quantity = $_SESSION['cart'][$product_id] ?? 0;
+
+        if ($new_quantity > 0) {
+            $difference = $new_quantity - $old_quantity;
+
+            // Nếu tăng số lượng → kiểm tra tồn kho
+            if ($difference > 0) {
+                $stmt = $pdo->prepare("SELECT stock FROM products WHERE id = ?");
+                $stmt->execute([$product_id]);
+                $stock = $stmt->fetchColumn();
+
+                if ($stock >= $difference) {
+                    $_SESSION['cart'][$product_id] = $new_quantity;
+                    $stmt = $pdo->prepare("UPDATE products SET stock = stock - ? WHERE id = ?");
+                    $stmt->execute([$difference, $product_id]);
+                } else {
+                    $error = "Sản phẩm ID $product_id không đủ hàng trong kho!";
+                }
+            }
+            // Nếu giảm số lượng → trả lại kho
+            elseif ($difference < 0) {
+                $_SESSION['cart'][$product_id] = $new_quantity;
+                $stmt = $pdo->prepare("UPDATE products SET stock = stock + ? WHERE id = ?");
+                $stmt->execute([abs($difference), $product_id]);
+            }
         } else {
+            // Xóa nếu người dùng nhập 0 và hoàn kho
+            $stmt = $pdo->prepare("UPDATE products SET stock = stock + ? WHERE id = ?");
+            $stmt->execute([$old_quantity, $product_id]);
             unset($_SESSION['cart'][$product_id]);
         }
     }
     $message = "Cập nhật giỏ hàng thành công!";
 }
+
 
 // Xử lý đặt hàng
 if (isset($_POST['checkout'])) {
@@ -981,7 +1031,7 @@ $current_page = isset($_GET['page']) ? $_GET['page'] : 'home';
                 <h2 class="section-title">Sản phẩm nổi bật</h2>
                 <div class="products-grid">
                     <?php foreach ($products as $product): ?>
-                        <div class="product-card">
+                        <div class="product-card" onclick='openProductPopup(<?php echo json_encode($product); ?>)' style="cursor: pointer;">
                             <img src="<?php echo $product['image']; ?>" alt="<?php echo htmlspecialchars($product['name']); ?>" class="product-image">
                             <div class="product-info">
                                 <h3 class="product-name"><?php echo htmlspecialchars($product['name']); ?></h3>
@@ -989,7 +1039,7 @@ $current_page = isset($_GET['page']) ? $_GET['page'] : 'home';
                                 <p class="product-description"><?php echo htmlspecialchars($product['description']); ?></p>
                                 <div class="product-stock">Còn lại: <?php echo $product['stock']; ?> sản phẩm</div>
                                 <?php if ($product['stock'] > 0): ?>
-                                    <form method="post" class="add-to-cart-form">
+                                    <form method="post" class="add-to-cart-form" onclick="event.stopPropagation();">
                                         <input type="hidden" name="product_id" value="<?php echo $product['id']; ?>">
                                         <input type="number" name="quantity" value="1" min="1" max="<?php echo $product['stock']; ?>" class="quantity-input">
                                         <button type="submit" name="add_to_cart" class="btn btn-primary">Thêm vào giỏ</button>
@@ -1303,6 +1353,14 @@ $current_page = isset($_GET['page']) ? $_GET['page'] : 'home';
                                     <td><?php echo $order['status']; ?></td>
                                     <td><?php echo date('d/m/Y H:i', strtotime($order['created_at'])); ?></td>
                                 </tr>
+                                <tr>
+                              <td colspan="4">
+                                <form method="post">
+                                    <input type="hidden" name="return_order_id" value="<?php echo $order['id']; ?>">
+                                    <textarea name="return_reason" required placeholder="Lý do trả hàng" style="width: 100%;"></textarea>
+                                    <button name="request_return" class="btn btn-warning">Yêu cầu trả hàng</button>
+                                </form>
+                            </td>
                             <?php endforeach; ?>
                         </tbody>
                     </table>
@@ -1428,5 +1486,98 @@ $current_page = isset($_GET['page']) ? $_GET['page'] : 'home';
         }
     }
     </script>
+<!-- pop up animation -->
+<div id="product-popup" class="modal">
+    <div class="modal-content">
+        <span class="close" onclick="closeModal('product-popup')">&times;</span>
+        
+        <h2 id="popup-name" style="margin-top: 0; text-align: center;"></h2>
+
+        <img id="popup-image" src="" alt="" style="width: 100%; max-height: 300px; object-fit: contain; margin-bottom: 1rem;">
+        
+        <p id="popup-description"></p>
+        <p id="popup-price" style="font-weight: bold; color: #e74c3c;"></p>
+        <p id="popup-stock"></p>
+    </div>
+</div>
+
+
+<script>
+function openProductPopup(product) {
+    document.getElementById('popup-name').textContent = product.name;
+    document.getElementById('popup-description').textContent = product.description;
+    document.getElementById('popup-price').textContent = formatCurrency(product.price) + ' VNĐ';
+    document.getElementById('popup-stock').textContent = 'Tồn kho: ' + product.stock + ' sản phẩm';
+    document.getElementById('popup-image').src = product.image;
+    openModal('product-popup');
+}
+
+function formatCurrency(value) {
+    return Number(value).toLocaleString('vi-VN');
+}
+</script>
+
+<div id="chat-bubble" onclick="toggleChat()" style="position: fixed; bottom: 20px; right: 20px; background: #007bff; color: white; padding: 12px 20px; border-radius: 50px; cursor: pointer; z-index: 999;">
+    💬 Chat trực tuyến
+</div>
+
+<div id="chat-box" style="display: none; position: fixed; bottom: 80px; right: 20px; width: 300px; height: 400px; border: 1px solid #ccc; background: white; z-index: 998;">
+    <div style="padding: 10px; background: #007bff; color: white;">
+        Hỗ trợ khách hàng
+        <span onclick="toggleChat()" style="float: right; cursor: pointer;">✖</span>
+    </div>
+    <div id="chat-messages" style="height: 300px; overflow-y: auto; padding: 10px; background: #f1f1f1;"></div>
+    <form id="chat-form" style="display: flex; border-top: 1px solid #ccc;">
+        <input type="text" id="chat-input" placeholder="Nhắn..." style="flex: 1; padding: 10px; border: none;">
+        <button type="submit" style="padding: 10px; background: #007bff; color: white; border: none;">Gửi</button>
+    </form>
+</div>
+
+<script>
+function toggleChat() {
+    const box = document.getElementById("chat-box");
+    box.style.display = (box.style.display === "none" || box.style.display === "") ? "block" : "none";
+}
+
+// Gửi tin nhắn
+document.getElementById("chat-form").addEventListener("submit", function(e) {
+    e.preventDefault();
+    const message = document.getElementById("chat-input").value;
+    if (message.trim() === "") return;
+
+    fetch("send_message.php", {
+        method: "POST",
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: `message=${encodeURIComponent(message)}`
+    }).then(() => {
+        document.getElementById("chat-input").value = "";
+        loadMessages();
+    });
+});
+
+// Tải tin nhắn liên tục
+function loadMessages() {
+    fetch("fetch_messages.php")
+    .then(res => res.json())
+    .then(data => {
+        const box = document.getElementById("chat-messages");
+        box.innerHTML = "";
+        data.forEach(msg => {
+            const div = document.createElement("div");
+            div.style.margin = "5px 0";
+            div.style.textAlign = (msg.sender === "user") ? "left" : "right";
+            div.innerHTML = `<div style="display: inline-block; padding: 8px 12px; background: ${msg.sender === "user" ? "#eee" : "#d1ecf1"}; border-radius: 10px;">${msg.message}</div>`;
+            box.appendChild(div);
+        });
+        box.scrollTop = box.scrollHeight;
+    });
+}
+
+// Tải lại mỗi 3s
+setInterval(loadMessages, 3000);
+loadMessages(); // lần đầu
+</script>
+
+
 </body>
 </html>
